@@ -54,6 +54,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
+from megatron.core.optimizer.optimizer import param_group_identifier_keys
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -484,6 +485,39 @@ def preprocess_common_state_dict(common_state_dict):
     # Remove rank and local rank from state dict if it exists, since they are expected to be different
     preprocessed_common_state_dict['args'].pop('local_rank', None)
     preprocessed_common_state_dict['args'].pop('rank', None)
+    if (
+        preprocessed_common_state_dict['args']['use_distributed_optimizer']
+        and "optimizer" in preprocessed_common_state_dict
+    ):
+        def reorder_inner_param_groups(optimizer_state_dict):
+            # When distributed optimizer loading, source param groups will be reordered,
+            # so we reorder the param groups here to prevent warning.
+
+            # Pop empty param_state.
+            if "param_state" in optimizer_state_dict and not optimizer_state_dict["param_state"]:
+                optimizer_state_dict.pop("param_state")
+
+            # Reorder param groups.
+            if "optimizer" not in optimizer_state_dict:
+                return
+            inner_optimizer = optimizer_state_dict["optimizer"]
+            if "param_groups" not in inner_optimizer:
+                return
+            param_groups = inner_optimizer["param_groups"]
+            key_fn = lambda pg: [pg[key] for key in param_group_identifier_keys]
+            param_groups.sort(key=key_fn)
+            inner_optimizer["param_groups"] = param_groups
+
+        optimizer_state_dict = preprocessed_common_state_dict['optimizer']
+        if "optimizer" in optimizer_state_dict:
+            # Only 1 optimizer in chained optimizer.
+            reorder_inner_param_groups(optimizer_state_dict)
+        else:
+            # Multiple optimizers in chained optimizer.
+            for i in range(len(optimizer_state_dict)):
+                if i in optimizer_state_dict.keys():
+                    reorder_inner_param_groups(optimizer_state_dict[i])
+
     return preprocessed_common_state_dict
 
 
@@ -538,6 +572,23 @@ def get_cuda_graph_input_data(model, config, args, num_microbatches, num_model_c
         num_warmup_microbatches, num_model_chunks, schedule_table
     )
     print_rank_0(f'ORDER {order}')
+    
+    # Dump schedule table information to MegatronCollector
+    try:
+        from megatron_collector import MegatronCollector
+        MegatronCollector.dump_schedule_table(
+            num_microbatches, 
+            num_model_chunks, 
+            config.microbatch_group_size_per_vp_stage,
+            schedule_table,
+            order_data=order,
+            stage_name="virtual-pipeline-schedule"
+        )
+        print_rank_0("Schedule table dumped to MegatronCollector")
+    except ImportError:
+        print_rank_0("MegatronCollector not available for schedule table dump")
+    except Exception as e:
+        print_rank_0(f"Warning: Failed to dump schedule table: {e}")
 
     def get_make_graphed_callables_kwargs():
         kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
@@ -811,6 +862,16 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     app_metrics['app_build_optimizer_finish_time'] = one_logger_utils.get_timestamp_in_ms()
     config = get_model_config(model[0])
+    
+    # Configure MegatronCollector with model, optimizer, and scheduler
+    try:
+        from megatron_collector import MegatronCollector
+        MegatronCollector.set_core(model, optimizer, opt_param_scheduler)
+        print_rank_0("MegatronCollector configured with model, optimizer, and scheduler")
+    except ImportError:
+        print_rank_0("MegatronCollector not available, skipping configuration")
+    except Exception as e:
+        print_rank_0(f"Warning: Failed to configure MegatronCollector: {e}")
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -860,6 +921,7 @@ def pretrain(
             print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
         iteration = 0
+        num_floating_point_operations_so_far = 0
         if args.do_train and args.train_iters > 0:
             iteration, num_floating_point_operations_so_far = train(
                 forward_step_func,
@@ -987,10 +1049,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             mpu.get_pipeline_model_parallel_world_size() > 1
             and args.virtual_pipeline_model_parallel_size is not None
         ):
-            if model_type == ModelType.encoder_and_decoder:
-                assert (
-                    args.encoder_pipeline_model_parallel_size == 0
-                ), "Interleaved schedule not supported for model with encoder on separate PP rank"
             model = []
             for i in range(args.virtual_pipeline_model_parallel_size):
                 # Set pre_process and post_process only after virtual rank is set.
@@ -1004,25 +1062,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         else:
             pre_process = mpu.is_pipeline_first_stage()
             post_process = mpu.is_pipeline_last_stage()
-            add_encoder = True
-            add_decoder = True
-            if model_type == ModelType.encoder_and_decoder:
-                if mpu.get_pipeline_model_parallel_world_size() > 1:
-                    rank = mpu.get_pipeline_model_parallel_rank()
-                    first_decoder_rank = args.encoder_pipeline_model_parallel_size
-                    world_size = mpu.get_pipeline_model_parallel_world_size()
-                    pre_process = rank == 0 or rank == first_decoder_rank
-                    post_process = (rank == (first_decoder_rank - 1)) or (rank == (world_size - 1))
-                    add_encoder = mpu.is_inside_encoder(rank)
-                    add_decoder = mpu.is_inside_decoder(rank)
-                model = model_provider_func(
-                    pre_process=pre_process,
-                    post_process=post_process,
-                    add_encoder=add_encoder,
-                    add_decoder=add_decoder,
-                )
-            else:
-                model = model_provider_func(pre_process=pre_process, post_process=post_process)
+            model = model_provider_func(pre_process=pre_process, post_process=post_process)
             model.model_type = model_type
         return model
 
@@ -1235,6 +1275,9 @@ def setup_model_and_optimizer(
         scale_lr_cond,
         lr_mult,
         use_gloo_process_groups=args.enable_gloo_process_groups,
+        # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
+        #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
+        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
@@ -1351,16 +1394,25 @@ def setup_model_and_optimizer(
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
     num_microbatches = get_num_microbatches()
-    for _ in range(num_microbatches):
-        # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
-        batch = get_batch_on_this_tp_rank(data_iterator)
-        batch = get_batch_on_this_cp_rank(batch)
+    rerun_state_machine = get_rerun_state_machine()
+    while rerun_state_machine.should_run_forward_backward(data_iterator):
+        for _ in range(num_microbatches):
+            # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
+            batch = get_batch_on_this_tp_rank(data_iterator)
+            batch = get_batch_on_this_cp_rank(batch)
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config):
     """Single training step."""
     args = get_args()
     timers = get_timers()
+    
+    # Import MegatronCollector for tracing
+    try:
+        from megatron_collector import MegatronCollector
+        collector_available = True
+    except ImportError:
+        collector_available = False
 
     # CUDA Graph capturing only executes once, when it's the first training iteration.
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
@@ -1403,6 +1455,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+        
+        # Dump gradients after backward pass
+        if collector_available:
+            try:
+                MegatronCollector.dump_model("after-backward")
+            except Exception as e:
+                print_rank_0(f"Warning: Failed to dump gradients after backward: {e}")
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
@@ -1417,10 +1476,25 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
+    
+    # Dump parameters before optimizer step
+    if collector_available:
+        try:
+            MegatronCollector.dump_main_param("before-optimizer")
+        except Exception as e:
+            print_rank_0(f"Warning: Failed to dump parameters before optimizer: {e}")
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
+    
+    # Dump parameters after optimizer step and increment step counter
+    if collector_available:
+        try:
+            MegatronCollector.dump_main_param("after-optimizer")
+            MegatronCollector.step()
+        except Exception as e:
+            print_rank_0(f"Warning: Failed to dump parameters after optimizer: {e}")
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
@@ -1668,6 +1742,7 @@ def training_log(
             track_names=track_names,
             num_layers=args.num_layers,
             moe_layer_freq=args.moe_layer_freq,
+            mtp_num_layers=args.mtp_num_layers,
         )
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
@@ -2026,7 +2101,6 @@ def checkpoint_and_decide_exit(
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
             )
-        torch.distributed.barrier()
         print_datetime(f'exiting program at iteration {iteration}')
 
         return True
@@ -2078,7 +2152,8 @@ def train(
     # Make sure rerun_state_machine has the right iteration loaded from checkpoint.
     rerun_state_machine = get_rerun_state_machine()
     if rerun_state_machine.current_iteration != iteration:
-        print_rank_0(f"Setting rerun_state_machine.current_iteration to {iteration}...")
+        print_rank_0(f"Overwriting rerun_state_machine.current_iteration from "
+                     f"{rerun_state_machine.current_iteration} to {iteration}...")
         rerun_state_machine.current_iteration = iteration
 
     # Track E2E metrics at the start of training.
@@ -2339,6 +2414,8 @@ def train(
         learning_rate = None
         decoupled_learning_rate = None
         for param_group in optimizer.param_groups:
+            if len(param_group['params']) == 0:
+                continue
             if param_group['is_decoupled_lr']:
                 decoupled_learning_rate = param_group['lr']
             else:
