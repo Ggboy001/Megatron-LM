@@ -26,7 +26,7 @@ class MegatronCollector:
 
     @classmethod
     def initialize(cls):
-        root_dir = os.environ.get("VTIMELINE_LOGGER_DIR", "/var/log")
+        root_dir = os.environ.get("VTIMELINE_LOGGER_DIR", "$HOME/sly/code/Megatron-LM/db")
         db_dir = os.path.join(root_dir, "Collector")
         os.makedirs(db_dir, exist_ok=True)
 
@@ -34,8 +34,8 @@ class MegatronCollector:
 
         db_path = os.path.join(
             root_dir,
-            "Collector/coredump_{}_{}.db".format(
-                cls.ranks_info_["dp"], cls.ranks_info_["tp"]
+            "Collector/coredump_{}_{}_{}_{}.db".format(
+                cls.ranks_info_["dp"], cls.ranks_info_["tp"],cls.ranks_info_["pp"],cls.ranks_info_["cp"],
             ),
         )
         cls.db_ = duckdb.connect(db_path)
@@ -179,6 +179,115 @@ class MegatronCollector:
             
         except Exception as e:
             print(f"Error inserting schedule table data into coredump: {e}")
+
+    @classmethod
+    def register_layernorm_grad_hooks(cls):
+        if not cls.should_dump():
+            return
+        
+        try:
+            from megatron.core import parallel_state
+        except ImportError:
+            print("Warning: Cannot import parallel_state, skipping layernorm grad hook registration")
+            return
+        
+        # ???????????
+        cls.layernorm_grads_cache = {}
+        
+        def create_grad_hook(param_name):
+            def grad_hook(grad):
+                try:
+                    # ??????????????
+                    cls.layernorm_grads_cache[param_name] = {
+                        "grad_norm": grad.norm().item(),
+                        "grad_mean": grad.mean().item(), 
+                        "grad_std": grad.std().item(),
+                        "grad_max": grad.max().item(),
+                        "grad_min": grad.min().item(),
+                        "grad_cksum": _get_cksum(grad),
+                        "grad_shape": list(grad.shape),
+                        "grad_type": str(grad.type()),
+                    }
+                    
+                except Exception as e:
+                    print(f"Error in grad hook for {param_name}: {e}")
+                return grad  # ?????????
+            return grad_hook
+        
+        # ?????ayerNorm??????hook
+        for model in cls.model_:
+            for name, param in model.named_parameters():
+                if ('layernorm' in name.lower() or 'rmsnorm' in name.lower()) and param.requires_grad:
+                    # ??????hook
+                    param.register_hook(create_grad_hook(name))
+                    print(f"Registered grad hook for: {name}")
+
+    @classmethod
+    def dump_layernorm_grads(cls, stage_name: str):
+        if not cls.should_dump():
+            return
+        
+        try:
+            from megatron.core import parallel_state
+        except ImportError:
+            print("Warning: Cannot import parallel_state, skipping layernorm grad dump")
+            return
+        
+        # ???????????????????
+        if not hasattr(cls, 'layernorm_grads_cache'):
+            print(f"No layernorm grad cache found for stage {stage_name}")
+            return
+        
+        # ??????????????ook????????
+        for model in cls.model_:
+            for name, param in model.named_parameters():
+                if ('layernorm' in name.lower() or 'rmsnorm' in name.lower()) and param.requires_grad:
+                    
+                    grad_info = {
+                        "name": name,
+                        "stage": stage_name,
+                        "param_type": "layernorm",
+                        
+                        # ?????????
+                        "tp_size": parallel_state.get_tensor_model_parallel_world_size(),
+                        "cp_size": parallel_state.get_context_parallel_world_size(),
+                        "dp_size": parallel_state.get_data_parallel_world_size(),
+                        "tp_rank": parallel_state.get_tensor_model_parallel_rank(),
+                        "cp_rank": parallel_state.get_context_parallel_rank(),
+                        "dp_rank": parallel_state.get_data_parallel_rank(),
+                        
+                        # ?????????
+                        "param_shape": list(param.shape),
+                        "param_cksum": _get_cksum(param),
+                        
+                        # ??????????
+                        "sequence_parallel": getattr(param, "sequence_parallel", False),
+                        "average_gradients_across_tp_domain": getattr(param, "average_gradients_across_tp_domain", False),
+                    }
+                    
+                    # ??ook??????????????
+                    if name in cls.layernorm_grads_cache:
+                        grad_info.update(cls.layernorm_grads_cache[name])
+                        grad_info["grad_exists"] = True
+                        grad_info["grad_source"] = "hook_cache"
+                    else:
+                        grad_info["grad_exists"] = False
+                        grad_info["grad_source"] = "no_cache"
+                    
+                    # ?????????????
+                    grad_info["current_grad_exists"] = param.grad is not None
+                    if hasattr(param, 'main_grad'):
+                        grad_info["main_grad_exists"] = param.main_grad is not None
+                    
+                    grad_info.update(cls.ranks_info_)
+                    
+                    try:
+                        cls.db_.execute(
+                            "INSERT INTO coredump VALUES (?, ?, ?);",
+                            (cls.step_, stage_name, json.dumps(grad_info)),
+                        )
+                    except Exception as e:
+                        print(f"Error inserting layernorm grad data: {e}")
 
     @classmethod
     def step(cls):

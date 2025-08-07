@@ -1,8 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 """Pretrain and SFT GPT."""
-from megatron.core.pipeline_parallel.schedules import get_schedule_table
-from megatron_collector import MegatronCollector
 
 import datetime
 import os
@@ -48,60 +46,6 @@ import megatron.legacy.model  # isort: skip
 
 # NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
 
-
-def setup_megatron_collector():
-    """Initialize MegatronCollector with process group information."""
-    try:
-        # Get distributed training information
-        from megatron.core import parallel_state
-        
-        # Set up rank information for the collector
-        ranks_info = {
-            "dp": parallel_state.get_data_parallel_rank(),
-            "tp": parallel_state.get_tensor_model_parallel_rank(),
-            "pp": parallel_state.get_pipeline_model_parallel_rank(),
-            "world_size": parallel_state.get_data_parallel_world_size(),
-        }
-        
-        # Initialize the collector with rank information
-        MegatronCollector.set_process_group_info(ranks_info)
-        print_rank_0(f"MegatronCollector initialized with ranks: {ranks_info}")
-        
-    except Exception as e:
-        print_rank_0(f"Warning: Failed to initialize MegatronCollector: {e}")
-
-
-def setup_collector_with_model(model, optimizer, scheduler):
-    """Set up MegatronCollector with model, optimizer, and scheduler."""
-    try:
-        MegatronCollector.set_core(model, optimizer, scheduler)
-        print_rank_0("MegatronCollector configured with model, optimizer, and scheduler")
-    except Exception as e:
-        print_rank_0(f"Warning: Failed to configure MegatronCollector: {e}")
-
-
-def trace_training_step():
-    """Add trace calls for training step progression."""
-    try:
-        # Dump main parameters before optimization
-        MegatronCollector.dump_main_param("before-optimizer")
-        
-        # Increment step counter
-        MegatronCollector.step()
-        
-        print_rank_0(f"MegatronCollector: Training step {MegatronCollector.step_} traced")
-    except Exception as e:
-        print_rank_0(f"Warning: Failed to trace training step: {e}")
-
-
-def trace_post_optimization():
-    """Add trace calls after optimization step."""
-    try:
-        # Dump main parameters after optimization
-        MegatronCollector.dump_main_param("after-optimizer")
-    except Exception as e:
-        print_rank_0(f"Warning: Failed to trace post-optimization: {e}")
-
 try:
     from megatron.post_training.arguments import add_modelopt_args, modelopt_args_enabled
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
@@ -112,39 +56,6 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
-
-def _get_transformer_layer_spec(use_te, config):
-    """Get transformer layer specification based on configuration.
-    
-    Args:
-        use_te (bool): Whether to use Transformer Engine
-        args: Training arguments
-        config: Model configuration
-        
-    Returns:
-        transformer_layer_spec: The transformer layer specification
-    """
-    args = get_args()
-    if use_te:
-        return get_gpt_layer_with_transformer_engine_spec(
-            args.num_experts,
-            args.moe_grouped_gemm,
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            args.moe_use_legacy_grouped_gemm,
-            qk_l2_norm=args.qk_l2_norm,
-            use_kitchen=config.use_kitchen,
-        )
-    else:
-        return get_gpt_layer_local_spec(
-            args.num_experts,
-            args.moe_grouped_gemm,
-            args.qk_layernorm,
-            args.multi_latent_attention,
-            args.moe_use_legacy_grouped_gemm,
-            normalization=args.normalization,
-            use_kitchen=config.use_kitchen,
-        )
 
 
 def model_provider(
@@ -219,17 +130,30 @@ def model_provider(
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
             else:
                 # Define the decoder layer spec
-                transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
+                if use_te:
+                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                        args.num_experts,
+                        args.moe_grouped_gemm,
+                        args.qk_layernorm,
+                        args.multi_latent_attention,
+                        args.moe_use_legacy_grouped_gemm,
+                        qk_l2_norm=args.qk_l2_norm,
+                        use_kitchen=config.use_kitchen,
+                    )
+                else:
+                    transformer_layer_spec = get_gpt_layer_local_spec(
+                        args.num_experts,
+                        args.moe_grouped_gemm,
+                        args.qk_layernorm,
+                        args.multi_latent_attention,
+                        args.moe_use_legacy_grouped_gemm,
+                        normalization=args.normalization,
+                        use_kitchen=config.use_kitchen,
+                    )
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
-            if hasattr(transformer_layer_spec, 'layer_specs') and len(transformer_layer_spec.layer_specs) == 0:
-                # Get the decoder layer spec explicitly if no decoder layer in the last stage,
-                # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
-                transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
-            else:
-                transformer_layer_spec_for_mtp = transformer_layer_spec
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, transformer_layer_spec_for_mtp, use_transformer_engine=use_te, vp_stage=vp_stage
+                config, transformer_layer_spec, use_transformer_engine=use_te, vp_stage=vp_stage
             )
 
         model = GPTModel(
@@ -347,12 +271,6 @@ def forward_step(data_iterator, model: GPTModel):
     args = get_args()
     timers = get_timers()
 
-    # Dump model state before forward pass
-    try:
-        MegatronCollector.dump_model("before-forward")
-    except Exception as e:
-        print_rank_0(f"Warning: Failed to dump model state before forward: {e}")
-
     # Get the batch.
     timers('batch-generator', log_level=2).start()
     global stimer
@@ -367,12 +285,6 @@ def forward_step(data_iterator, model: GPTModel):
             output_tensor = model(
                 tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
             )
-
-    # Dump model state after forward pass
-    try:
-        MegatronCollector.dump_model("after-forward")
-    except Exception as e:
-        print_rank_0(f"Warning: Failed to dump model state after forward: {e}")
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
@@ -445,9 +357,6 @@ if __name__ == "__main__":
 
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
-
-    # Initialize MegatronCollector early
-    setup_megatron_collector()
 
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)

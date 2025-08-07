@@ -289,6 +289,20 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     """
 
     config = get_model_config(model[0])
+    
+    # Import MegatronCollector for LayerNorm gradient tracing
+    try:
+        from megatron_collector import MegatronCollector
+        collector_available = True
+    except ImportError:
+        collector_available = False
+    
+    # Trace LayerNorm gradients before finalization
+    if collector_available:
+        try:
+            MegatronCollector.dump_layernorm_grads("before-grad-finalize")
+        except Exception as e:
+            print(f"Warning: Failed to dump layernorm grads before finalize: {e}")
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:
@@ -312,7 +326,23 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         config.timers('non-tensor-parallel-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
+    
+    # Trace LayerNorm gradients before TP allreduce
+    if collector_available:
+        try:
+            MegatronCollector.dump_layernorm_grads("before-tp-allreduce")
+        except Exception as e:
+            print(f"Warning: Failed to dump layernorm grads before TP allreduce: {e}")
+    
     _allreduce_non_tensor_model_parallel_grads(model, config)
+    
+    # Trace LayerNorm gradients after TP allreduce
+    if collector_available:
+        try:
+            MegatronCollector.dump_layernorm_grads("after-tp-allreduce")
+        except Exception as e:
+            print(f"Warning: Failed to dump layernorm grads after TP allreduce: {e}")
+    
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()
 

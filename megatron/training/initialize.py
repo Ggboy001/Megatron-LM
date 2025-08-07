@@ -31,9 +31,17 @@ from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
 from megatron.training.yaml_arguments import validate_yaml
-
+from megatron.core import mpu
 logger = logging.getLogger(__name__)
-
+from megatron_collector import  MegatronCollector
+def get_all_ranks_info():
+    return {
+        'dp':mpu.get_data_parallel_rank(),
+        'tp':mpu.get_tensor_model_parallel_rank(),
+        'pp':mpu.get_pipeline_model_parallel_rank(),
+        'cp':mpu.get_context_parallel_rank(),
+        'ep':mpu.get_expert_model_parallel_rank(),
+    }
 
 def initialize_megatron(
     extra_args_provider=None,
@@ -164,7 +172,7 @@ def initialize_megatron(
         if args.tp_comm_overlap:
             # TODO: Should this be activated with just decoder-tp-comm-overlap too?
             _initialize_tp_communicators()
-
+        MegatronCollector.set_process_group_info(get_all_ranks_info())
         # No continuation function
         return None
 
