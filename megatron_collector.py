@@ -224,6 +224,7 @@ class MegatronCollector:
 
     @classmethod
     def dump_layernorm_grads(cls, stage_name: str):
+        """??????LayerNorm?????????????ook???"""
         if not cls.should_dump():
             return
         
@@ -233,12 +234,7 @@ class MegatronCollector:
             print("Warning: Cannot import parallel_state, skipping layernorm grad dump")
             return
         
-        # ???????????????????
-        if not hasattr(cls, 'layernorm_grads_cache'):
-            print(f"No layernorm grad cache found for stage {stage_name}")
-            return
-        
-        # ??????????????ook????????
+        # ??????????????????????????
         for model in cls.model_:
             for name, param in model.named_parameters():
                 if ('layernorm' in name.lower() or 'rmsnorm' in name.lower()) and param.requires_grad:
@@ -265,19 +261,54 @@ class MegatronCollector:
                         "average_gradients_across_tp_domain": getattr(param, "average_gradients_across_tp_domain", False),
                     }
                     
-                    # ??ook??????????????
-                    if name in cls.layernorm_grads_cache:
-                        grad_info.update(cls.layernorm_grads_cache[name])
-                        grad_info["grad_exists"] = True
-                        grad_info["grad_source"] = "hook_cache"
-                    else:
-                        grad_info["grad_exists"] = False
-                        grad_info["grad_source"] = "no_cache"
+                    # ????????????????
+                    current_grad = None
+                    grad_source = "no_grad"
                     
-                    # ?????????????
-                    grad_info["current_grad_exists"] = param.grad is not None
-                    if hasattr(param, 'main_grad'):
-                        grad_info["main_grad_exists"] = param.main_grad is not None
+                    # ???????param.grad
+                    if param.grad is not None:
+                        current_grad = param.grad
+                        grad_source = "param_grad"
+                    # ???????main_grad
+                    elif hasattr(param, 'main_grad') and param.main_grad is not None:
+                        current_grad = param.main_grad
+                        grad_source = "main_grad"
+                    
+                    if current_grad is not None:
+                        grad_info.update({
+                            "grad_norm": current_grad.norm().item(),
+                            "grad_mean": current_grad.mean().item(),
+                            "grad_std": current_grad.std().item(),
+                            "grad_max": current_grad.max().item(),
+                            "grad_min": current_grad.min().item(),
+                            "grad_cksum": _get_cksum(current_grad),
+                            "grad_shape": list(current_grad.shape),
+                            "grad_type": str(current_grad.type()),
+                            "grad_exists": True,
+                            "grad_source": grad_source
+                        })
+                        
+                        # ?????????
+                        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                        print(f"[TP{tp_rank}] {stage_name}: {name} {grad_source}_norm={current_grad.norm().item():.8f}")
+                    else:
+                        grad_info.update({
+                            "grad_exists": False,
+                            "grad_source": grad_source
+                        })
+                        
+                        # ?????????
+                        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                        print(f"[TP{tp_rank}] {stage_name}: {name} NO_GRAD")
+                    
+                    # ?????ook???????????????
+                    if hasattr(cls, 'layernorm_grads_cache') and name in cls.layernorm_grads_cache:
+                        hook_data = cls.layernorm_grads_cache[name]
+                        grad_info["hook_grad_norm"] = hook_data["grad_norm"]
+                        grad_info["hook_grad_cksum"] = hook_data["grad_cksum"]
+                        grad_info["hook_available"] = True
+                    else:
+                        grad_info["hook_available"] = False
                     
                     grad_info.update(cls.ranks_info_)
                     
