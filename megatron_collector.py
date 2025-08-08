@@ -214,10 +214,10 @@ class MegatronCollector:
                 return grad  # ?????????
             return grad_hook
         
-        # ?????ayerNorm??????hook
+        # ?????orm????????ook
         for model in cls.model_:
             for name, param in model.named_parameters():
-                if ('layernorm' in name.lower() or 'rmsnorm' in name.lower()) and param.requires_grad:
+                if ('norm' in name.lower()) and param.requires_grad:
                     # ??????hook
                     param.register_hook(create_grad_hook(name))
                     print(f"Registered grad hook for: {name}")
@@ -237,12 +237,12 @@ class MegatronCollector:
         # ??????????????????????????
         for model in cls.model_:
             for name, param in model.named_parameters():
-                if ('layernorm' in name.lower() or 'rmsnorm' in name.lower()) and param.requires_grad:
+                if ('norm' in name.lower()) and param.requires_grad:
                     
                     grad_info = {
                         "name": name,
                         "stage": stage_name,
-                        "param_type": "layernorm",
+                        "param_type": "norm",
                         
                         # ?????????
                         "tp_size": parallel_state.get_tensor_model_parallel_world_size(),
